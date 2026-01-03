@@ -47,6 +47,25 @@ func (e ReadError) Unwrap() error {
 	return e.Err
 }
 
+type readerOptions struct {
+	fs       afero.Fs
+	password string
+}
+
+type ReaderOption func(*readerOptions)
+
+func WithFs(fs afero.Fs) ReaderOption {
+	return func(ro *readerOptions) {
+		ro.fs = fs
+	}
+}
+
+func WithPassword(password string) ReaderOption {
+	return func(ro *readerOptions) {
+		ro.password = password
+	}
+}
+
 // A Reader serves content from a 7-Zip archive.
 type Reader struct {
 	r     io.ReaderAt
@@ -253,14 +272,25 @@ func openReader(fs afero.Fs, name string) (io.ReaderAt, int64, []afero.File, err
 // password as the basis of the decryption key and return a [*ReadCloser]. If
 // name has a ".001" suffix it is assumed there are multiple volumes and each
 // sequential volume will be opened.
-func OpenReaderWithPassword(name, password string) (*ReadCloser, error) {
-	reader, size, files, err := openReader(afero.NewOsFs(), name)
+func OpenReaderWithPassword(name, password string, opts ...ReaderOption) (*ReadCloser, error) {
+	options := &readerOptions{password: password}
+	for _, opt := range opts {
+		opt(options)
+	}
+	if password != "" && options.password != "" && password != options.password {
+		panic("sevenzip: conflicting passwords provided")
+	}
+	fs := options.fs
+	if fs == nil {
+		fs = afero.NewOsFs()
+	}
+	reader, size, files, err := openReader(fs, name)
 	if err != nil {
 		return nil, err
 	}
 
 	r := new(ReadCloser)
-	r.p = password
+	r.p = options.password
 
 	if err := r.init(reader, size); err != nil {
 		errs := make([]error, 0, len(files)+1)
@@ -281,8 +311,8 @@ func OpenReaderWithPassword(name, password string) (*ReadCloser, error) {
 // OpenReader will open the 7-zip file specified by name and return a
 // [*ReadCloser]. If name has a ".001" suffix it is assumed there are multiple
 // volumes and each sequential volume will be opened.
-func OpenReader(name string) (*ReadCloser, error) {
-	return OpenReaderWithPassword(name, "")
+func OpenReader(name string, opts ...ReaderOption) (*ReadCloser, error) {
+	return OpenReaderWithPassword(name, "", opts...)
 }
 
 // NewReaderWithPassword returns a new [*Reader] reading from r using password
