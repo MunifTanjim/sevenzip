@@ -142,6 +142,16 @@ func (fr *fileReader) Close() error {
 		return nil
 	}
 
+	if err := fr.returnToPoolOrClose(); err != nil {
+		return err
+	}
+
+	fr.rc = nil
+
+	return nil
+}
+
+func (fr *fileReader) returnToPoolOrClose() error {
 	offset, err := fr.rc.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return fmt.Errorf("sevenzip: error seeking current position: %w", err)
@@ -158,9 +168,78 @@ func (fr *fileReader) Close() error {
 		}
 	}
 
-	fr.rc = nil
-
 	return nil
+}
+
+func (fr *fileReader) Seek(offset int64, whence int) (int64, error) {
+	fileSize := int64(fr.f.UncompressedSize) //nolint:gosec
+
+	// Calculate target position within the file
+	var newPos int64
+
+	switch whence {
+	case io.SeekStart:
+		newPos = offset
+	case io.SeekCurrent:
+		currentPos := fileSize - fr.n
+		newPos = currentPos + offset
+	case io.SeekEnd:
+		newPos = fileSize + offset
+	default:
+		return 0, errInvalidWhence
+	}
+
+	// Validate bounds
+	if newPos < 0 {
+		return 0, errNegativeSeek
+	}
+
+	if newPos > fileSize {
+		return 0, errSeekEOF
+	}
+
+	// Calculate absolute position in folder stream
+	absPos := fr.f.offset + newPos
+
+	// Try to delegate to underlying folder reader
+	if _, err := fr.rc.Seek(absPos, io.SeekStart); err != nil {
+		// If we get a backward seek error, we need to get a fresh reader
+		if !errors.Is(err, errSeekBackwards) {
+			return 0, err
+		}
+
+		// Return current reader to pool or close it
+		if err := fr.returnToPoolOrClose(); err != nil {
+			return 0, err
+		}
+
+		// Get a new reader from pool or create fresh one
+		rc, _ := fr.f.zip.pool[fr.f.folder].Get(absPos)
+		if rc == nil {
+			var encrypted bool
+
+			rc, _, encrypted, err = fr.f.zip.folderReader(fr.f.zip.si, fr.f.folder)
+			if err != nil {
+				return 0, &ReadError{
+					Encrypted: encrypted,
+					Err:       err,
+				}
+			}
+		}
+
+		// Seek to the absolute position
+		if _, err = rc.Seek(absPos, io.SeekStart); err != nil {
+			_ = rc.Close()
+			return 0, err
+		}
+
+		fr.rc = rc
+	}
+
+	// Update remaining bytes
+	fr.n = fileSize - newPos
+
+	return newPos, nil
 }
 
 // Open returns an [io.ReadCloser] that provides access to the [File]'s

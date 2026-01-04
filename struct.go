@@ -2,6 +2,7 @@ package sevenzip
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"hash"
@@ -90,6 +91,31 @@ func (f *folder) findOutBindPair(i uint64) *bindPair {
 	return nil
 }
 
+// isCopyOnly returns true if this folder uses only the Copy method (no compression/encryption).
+func (f *folder) isCopyOnly() bool {
+	return len(f.coder) == 1 && bytes.Equal(f.coder[0].id, []byte{0x00})
+}
+
+// sectionReaderWrapper wraps io.SectionReader to implement io.ByteReader (required by util.Reader).
+type sectionReaderWrapper struct {
+	*io.SectionReader
+}
+
+func (s *sectionReaderWrapper) ReadByte() (byte, error) {
+	var b [1]byte
+
+	n, err := s.Read(b[:])
+	if err != nil {
+		return 0, err //nolint:wrapcheck
+	}
+
+	if n == 0 {
+		return 0, io.ErrNoProgress
+	}
+
+	return b[0], nil
+}
+
 func (f *folder) coderReader(readers []io.ReadCloser, coder uint64, password string) (io.ReadCloser, bool, error) {
 	dcomp := decompressor(f.coder[coder].id)
 	if dcomp == nil {
@@ -117,20 +143,52 @@ type folderReadCloser struct {
 	wc            *plumbing.WriteCounter
 	size          int64
 	hasEncryption bool
+	// Fields for optimized seeking in Copy-only folders
+	seeker     io.Seeker // Reference to underlying seekable reader (nil if not seekable)
+	isCopyOnly bool      // True if folder uses only Copy method
+	pos        int64     // Current position for seekable readers
 }
 
 func (rc *folderReadCloser) Checksum() []byte {
 	return rc.h.Sum(nil)
 }
 
+func (rc *folderReadCloser) Read(p []byte) (int, error) {
+	n, err := rc.ReadCloser.Read(p)
+
+	// Update position for Copy-only folders
+	if rc.isCopyOnly {
+		rc.pos += int64(n)
+	}
+
+	return n, err //nolint:wrapcheck
+}
+
+// currentPosition returns the current read position within the folder.
+func (rc *folderReadCloser) currentPosition() int64 {
+	if rc.isCopyOnly {
+		return rc.pos
+	}
+
+	return int64(rc.wc.Count()) //nolint:gosec
+}
+
+// canSeekOptimized returns true if this reader can perform fast direct seeks.
+// This is only possible for Copy-only folders with a seekable underlying reader.
+func (rc *folderReadCloser) canSeekOptimized() bool {
+	return rc.isCopyOnly && rc.seeker != nil
+}
+
 func (rc *folderReadCloser) Seek(offset int64, whence int) (int64, error) {
 	var newo int64
+
+	currentPos := rc.currentPosition()
 
 	switch whence {
 	case io.SeekStart:
 		newo = offset
 	case io.SeekCurrent:
-		newo = int64(rc.wc.Count()) + offset //nolint:gosec
+		newo = currentPos + offset
 	case io.SeekEnd:
 		newo = rc.Size() + offset
 	default:
@@ -141,15 +199,29 @@ func (rc *folderReadCloser) Seek(offset int64, whence int) (int64, error) {
 		return 0, errNegativeSeek
 	}
 
-	if uint64(newo) < rc.wc.Count() {
-		return 0, errSeekBackwards
-	}
-
 	if newo > rc.Size() {
 		return 0, errSeekEOF
 	}
 
-	if _, err := io.CopyN(io.Discard, rc, newo-int64(rc.wc.Count())); err != nil { //nolint:gosec
+	// Fast path: optimized seeking for Copy-only folders
+	if rc.canSeekOptimized() {
+		if _, err := rc.seeker.Seek(newo, io.SeekStart); err != nil {
+			return 0, fmt.Errorf("sevenzip: error seeking: %w", err)
+		}
+
+		// Update position and reset CRC (CRC is no longer valid after seek)
+		rc.pos = newo
+		rc.h.Reset()
+
+		return newo, nil
+	}
+
+	// Slow path: sequential read for compressed data (forward only)
+	if newo < currentPos {
+		return 0, errSeekBackwards
+	}
+
+	if _, err := io.CopyN(io.Discard, rc, newo-currentPos); err != nil {
 		return 0, fmt.Errorf("sevenzip: error seeking: %w", err)
 	}
 
@@ -161,12 +233,18 @@ func (rc *folderReadCloser) Size() int64 {
 }
 
 func newFolderReadCloser(rc io.ReadCloser, size int64, hasEncryption bool) *folderReadCloser {
+	return newFolderReadCloserWithSeeker(rc, size, hasEncryption, nil, false)
+}
+
+func newFolderReadCloserWithSeeker(rc io.ReadCloser, size int64, hasEncryption bool, seeker io.Seeker, isCopyOnly bool) *folderReadCloser {
 	nrc := new(folderReadCloser)
 	nrc.h = crc32.NewIEEE()
 	nrc.wc = new(plumbing.WriteCounter)
 	nrc.ReadCloser = plumbing.TeeReadCloser(rc, io.MultiWriter(nrc.h, nrc.wc))
 	nrc.size = size
 	nrc.hasEncryption = hasEncryption
+	nrc.seeker = seeker
+	nrc.isCopyOnly = isCopyOnly
 
 	return nrc
 }
@@ -270,9 +348,23 @@ func (si *streamsInfo) folderReader(r io.ReaderAt, folder int, password string) 
 
 	offset := int64(0)
 
+	// Check if this is a Copy-only folder with a single packed stream
+	isCopyOnly := f.isCopyOnly() && len(f.packed) == 1
+	var sectionReader *io.SectionReader
+
 	for i, input := range f.packed {
 		size := int64(si.packInfo.size[packedOffset+i]) //nolint:gosec
-		in[input] = util.NopCloser(bufio.NewReader(io.NewSectionReader(r, si.folderOffset(folder)+offset, size)))
+		sr := io.NewSectionReader(r, si.folderOffset(folder)+offset, size)
+
+		if isCopyOnly {
+			// For Copy-only, use sectionReaderWrapper to preserve seek capability
+			sectionReader = sr
+			in[input] = util.NopCloser(&sectionReaderWrapper{sr})
+		} else {
+			// Standard path: wrap in bufio.Reader for buffered reads
+			in[input] = util.NopCloser(bufio.NewReader(sr))
+		}
+
 		offset += size
 	}
 
@@ -329,7 +421,13 @@ func (si *streamsInfo) folderReader(r io.ReaderAt, folder int, password string) 
 		return nil, 0, hasEncryption, errNoUnboundStream
 	}
 
-	fr := newFolderReadCloser(out[unbound[0]], int64(f.unpackSize()), hasEncryption) //nolint:gosec
+	var fr *folderReadCloser
+
+	if isCopyOnly && sectionReader != nil {
+		fr = newFolderReadCloserWithSeeker(out[unbound[0]], int64(f.unpackSize()), hasEncryption, sectionReader, true) //nolint:gosec
+	} else {
+		fr = newFolderReadCloser(out[unbound[0]], int64(f.unpackSize()), hasEncryption) //nolint:gosec
+	}
 
 	if si.unpackInfo.digest != nil {
 		return fr, si.unpackInfo.digest[folder], hasEncryption, nil
