@@ -39,38 +39,59 @@ func newCopyReader(_ []byte, _ uint64, readers []io.ReadCloser) (io.ReadCloser, 
 	return readers[0], nil
 }
 
+// https://github.com/ip7z/7zip/blob/main/DOC/Methods.txt
+type MethodId []byte
+
+var (
+	MethodIdCopy    = MethodId{0x00}
+	MethodIdDelta   = MethodId{0x03}
+	MethodIdLZMA    = MethodId{0x03, 0x01, 0x01}
+	MethodIdBCJ     = MethodId{0x03, 0x03, 0x01, 0x03}
+	MethodIdBCJ2    = MethodId{0x03, 0x03, 0x01, 0x1b}
+	MethodIdPPC     = MethodId{0x03, 0x03, 0x02, 0x05}
+	MethodIdARM     = MethodId{0x03, 0x03, 0x05, 0x01}
+	MethodIdSPARC   = MethodId{0x03, 0x03, 0x08, 0x05}
+	MethodIdDeflate = MethodId{0x04, 0x01, 0x08}
+	MethodIdBzip2   = MethodId{0x04, 0x02, 0x02}
+	MethodIdZstd    = MethodId{0x04, 0xf7, 0x11, 0x01}
+	MethodIdBrotli  = MethodId{0x04, 0xf7, 0x11, 0x02}
+	MethodIdLZ4     = MethodId{0x04, 0xf7, 0x11, 0x04}
+	MethodId7ZAES   = MethodId{0x06, 0xf1, 0x07, 0x01}
+	MethodIdLZMA2   = MethodId{0x21}
+)
+
 //nolint:gochecknoinits
 func init() {
 	// Copy
-	RegisterDecompressor([]byte{0x00}, Decompressor(newCopyReader))
+	RegisterDecompressor(MethodIdCopy, Decompressor(newCopyReader))
 	// Delta
-	RegisterDecompressor([]byte{0x03}, Decompressor(delta.NewReader))
+	RegisterDecompressor(MethodIdDelta, Decompressor(delta.NewReader))
 	// LZMA
-	RegisterDecompressor([]byte{0x03, 0x01, 0x01}, Decompressor(lzma.NewReader))
+	RegisterDecompressor(MethodIdLZMA, Decompressor(lzma.NewReader))
 	// BCJ
-	RegisterDecompressor([]byte{0x03, 0x03, 0x01, 0x03}, Decompressor(bra.NewBCJReader))
+	RegisterDecompressor(MethodIdBCJ, Decompressor(bra.NewBCJReader))
 	// BCJ2
-	RegisterDecompressor([]byte{0x03, 0x03, 0x01, 0x1b}, Decompressor(bcj2.NewReader))
+	RegisterDecompressor(MethodIdBCJ2, Decompressor(bcj2.NewReader))
 	// PPC
-	RegisterDecompressor([]byte{0x03, 0x03, 0x02, 0x05}, Decompressor(bra.NewPPCReader))
+	RegisterDecompressor(MethodIdPPC, Decompressor(bra.NewPPCReader))
 	// ARM
-	RegisterDecompressor([]byte{0x03, 0x03, 0x05, 0x01}, Decompressor(bra.NewARMReader))
+	RegisterDecompressor(MethodIdARM, Decompressor(bra.NewARMReader))
 	// SPARC
-	RegisterDecompressor([]byte{0x03, 0x03, 0x08, 0x05}, Decompressor(bra.NewSPARCReader))
+	RegisterDecompressor(MethodIdSPARC, Decompressor(bra.NewSPARCReader))
 	// Deflate
-	RegisterDecompressor([]byte{0x04, 0x01, 0x08}, Decompressor(deflate.NewReader))
+	RegisterDecompressor(MethodIdDeflate, Decompressor(deflate.NewReader))
 	// Bzip2
-	RegisterDecompressor([]byte{0x04, 0x02, 0x02}, Decompressor(bzip2.NewReader))
+	RegisterDecompressor(MethodIdBzip2, Decompressor(bzip2.NewReader))
 	// Zstandard
-	RegisterDecompressor([]byte{0x04, 0xf7, 0x11, 0x01}, Decompressor(zstd.NewReader))
+	RegisterDecompressor(MethodIdZstd, Decompressor(zstd.NewReader))
 	// Brotli
-	RegisterDecompressor([]byte{0x04, 0xf7, 0x11, 0x02}, Decompressor(brotli.NewReader))
+	RegisterDecompressor(MethodIdBrotli, Decompressor(brotli.NewReader))
 	// LZ4
-	RegisterDecompressor([]byte{0x04, 0xf7, 0x11, 0x04}, Decompressor(lz4.NewReader))
+	RegisterDecompressor(MethodIdLZ4, Decompressor(lz4.NewReader))
 	// AES-CBC-256 & SHA-256
-	RegisterDecompressor([]byte{0x06, 0xf1, 0x07, 0x01}, Decompressor(aes7z.NewReader))
+	RegisterDecompressor(MethodId7ZAES, Decompressor(aes7z.NewReader))
 	// LZMA2
-	RegisterDecompressor([]byte{0x21}, Decompressor(lzma2.NewReader))
+	RegisterDecompressor(MethodIdLZMA2, Decompressor(lzma2.NewReader))
 }
 
 // RegisterDecompressor allows custom decompressors for a specified method ID.
