@@ -32,9 +32,20 @@ func (nopCloser) Close() error {
 	return nil
 }
 
+// nopSeekCloser is a nopCloser that also implements io.ReadSeeker.
+type nopSeekCloser struct {
+	nopCloser
+	io.Seeker
+}
+
 // NopCloser returns a ReadCloser with a no-op Close method wrapping the
-// provided Reader r.
+// provided Reader r. If r also implements io.Seeker, the returned value
+// will implement io.ReadSeeker.
 func NopCloser(r Reader) ReadCloser {
+	if s, ok := r.(io.Seeker); ok {
+		return &nopSeekCloser{nopCloser{r}, s}
+	}
+
 	return &nopCloser{r}
 }
 
